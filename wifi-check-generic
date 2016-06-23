@@ -1,0 +1,154 @@
+#! /bin/bash
+
+# This script can be run by any user with permissions to control the wifi
+# interface - however, if it is run as a cron job it will require root
+# permissions to re-enable a disabled WiFi radio.  It has been tested 
+# succesfully with the following use cases:
+# WiFi disabled (nmcli radio wifi off)
+# Network device disabled, but WiFi enabled (nmcli dev dis dev_name)
+# Ethernet connection down (nmcli con down conn_name)
+#
+# Besides testing with nmcli, connectivity is confirmed with a wget spider
+# command to a well known highly available web server (e.g., google.com)
+# We do not use icmp/ping to do connectivity testing; this may be 
+# prohibited in some environments and would always fail.
+# It is not necessary to restart the network service; operations are 
+# limited to just the WiFi connection.
+#
+# This script logs to the systemd journal with systemd-cat, and you can 
+# see the entries with "journalctl -t script_name"
+# You can see the latest entries first by using "-r", or you
+# can have "follow" functionality with "-f"
+# Finally, you can see all messages since last boot with "--boot"
+# Example:  journalctl -rt wifi-check --boot
+#
+# Best to call this script as a cron job, with something like 20 minute
+# granularity, depending on how unstable your wifi connection is.
+# 
+# Finally, this script will not fix network connectivity issues that 
+# originate outside of this machine.
+
+
+device="wlp3s0"			# device name, e.g., wlp[bus #]s[slot #]
+conn="My_SSID"			# connection name often matches WiFi SSID
+test_target="google.com"	# choose something reliable
+hostname=$(uname -n)
+script=$(basename $0)
+DO_RECOVERY=0
+
+# try to get an http response from a well known HA server
+# We use "--spider" to avoid actually bringing down content, because
+# all we really need is a success response like HTTP 200
+online_test() {
+	wget -q --tries=10 --timeout=20 --spider http://${test_target}
+}
+
+online_test
+if [ $? -eq 0 ]; then
+	echo "$hostname wifi is connected" | systemd-cat -t $script -p info
+else 
+	echo "$hostname may be offline: wget failed" | systemd-cat -t $script -p alert
+	DO_RECOVERY=1
+fi
+
+# Network Manager device status codes 
+# GENERAL.STATE:10 (unmanaged) ==> we should never see this
+# GENERAL.STATE:20 (unavailable) ==> wifi probably disabled
+# GENERAL.STATE:30 (disconnected) ==> wifi enabled, but conn down
+# GENERAL.STATE:100 (connected)
+device_test() {
+  nmcli_out=$(nmcli -t -f GENERAL.STATE device show $device)
+  rgx="GENERAL.STATE\:([0-9]+)"
+  [[ $nmcli_out =~ $rgx ]]
+  return "${BASH_REMATCH[1]}"	
+}
+
+# network connection state; $con_state -eq 0 means not active
+conn_test() {
+	count=$(nmcli -t -f NAME conn show --active | grep wlp3s0 | wc -l)
+	return $count
+}
+
+if [[ $DO_RECOVERY -eq 1 ]]; then
+
+# Recovery steps
+# 1 - Is WiFi enabled?  If not, then fix it.
+# wifi radio state is either enabled or disabled
+
+  wifi_status=$(nmcli r wifi)
+  if [[ $wifi_status =~ "disabled" ]]; then
+        echo "WiFi is disabled... enabling it now." | systemd-cat -t $script -p info
+
+	nmcli r wifi on  # this one line won't work for non-root cron jobs
+
+	sleep 15  # give everything a few seconds to re-connect.
+
+	wifi_status=$(nmcli r wifi)
+	if [[ $wifi_status =~ "enabled" ]]; then
+		echo "WiFi is successfully enabled in Recovery Phase 1" | systemd-cat -t $script -p info
+	else
+		echo "ERROR: WiFi was NOT successfully enabled in Recovery Phase 1." | systemd-cat -t $script -p err
+	fi
+
+	device_test
+	if [[ $? -eq 100 ]]; then
+		echo "${device} is available and is connected" | systemd-cat -t $script -p info
+	elif [[ $? -eq 30 ]]; then
+		echo "${device} is available, but is not connected yet" | systemd-cat -t $script -p info
+	elif [[ $? -eq 20 ]]; then
+		echo "ERROR: ${device} is not available in Recovery Phase 1" | systemd-cat -t $script -p err
+	fi
+
+	conn_test
+	if [[ $? > 0 ]]; then
+		echo "Connection $conn is up in Recovery Phase 1" | systemd-cat -t $script -p info
+	else
+		echo "Connection $conn is down, attempting to bring it up" | systemd-cat -t $script -p info
+		nmcli c up $conn
+		conn_test
+		if [ $? > 0 ]; then echo "Success!" | systemd-cat -t $script -p info
+		fi
+	fi
+
+	online_test
+	if [ $? -eq 0 ]; then
+		echo "$hostname is back online. Recovery script is finished." | systemd-cat -t $script -p info
+		DO_RECOVERY=0		# We're done now.
+	else echo "$hostname is still offline in Recovery Phase 1" | systemd-cat -t $script -p info
+	fi
+
+  else echo "Phase 1 check: WiFi is enabled" | systemd-cat -t $script -p info
+
+  fi # end wifi_status check
+
+fi  # end DO_RECOVERY Phase 1
+
+# echo "DO_RECOVERY flag is ${DO_RECOVERY} after Phase 1" | systemd-cat -t $script -p debug
+
+# re-using the recovery flag is a bit stupid, but I'm tired.
+if [[ $DO_RECOVERY -eq 1 ]]; then
+
+#  echo "In Phase 2 now" | systemd-cat -t $script -p debug
+
+  # 2 - WiFi is enabled, how about the network device?
+  device_test
+  dev_status=$?
+  if [[ $dev_status > 20 ]]; then	# see network device status codes above
+	nmcli conn up $conn
+	if [[ $? -eq 0 ]]; then 
+	  echo "Connection ${conn} is up in Phase 2" | systemd-cat -t $script -p debug
+	  online_test
+	  if [ $? -eq 0 ]; then
+	    echo "$hostname is back online" | systemd-cat -t $script -p info
+	  else echo "$hostname is still offline in Phase 2" | systemd-cat -t $script -p debug
+	  fi  # end online test
+	else 
+	  echo "ERROR: Connection ${conn} did not come up in Phase 2" | systemd-cat -t $script -p err
+	fi # end conn test
+  else
+	echo "ERROR: Device status is ${dev_status} - this can't be brought up in Phase 2" | systemd-cat -t $script -p err
+  fi
+
+fi # end second round of DO_RECOVERY
+
+exit
